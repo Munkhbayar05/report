@@ -33,7 +33,21 @@ public:
             value = store[key];
             return true;
         }
-        return false;\
+        return false;
+    }
+    bool has(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return store.find(key) != store.end();
+    }
+
+    bool upd(const std::string& key, const std::string& new_value) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = store.find(key);
+        if (it != store.end()) {
+            it->second = new_value;
+            return true;
+        }
+        return false;
     }
 
     bool del(const std::string& key) {
@@ -55,6 +69,27 @@ public:
     }
 };
 
+class DatabaseManager {
+private:
+    std::unordered_map<std::string, KVDatabase> databases;
+    std::mutex mutex;
+
+public:
+    KVDatabase& getDatabase(const std::string& name) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return databases[name];
+    }
+    std::vector<std::string> listDatabases() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<std::string> names;
+        for (const auto& pair : databases) {
+            names.push_back(pair.first);
+        }
+        return names;
+    }
+    
+};
+
 struct Task {
     int client_socket;
     std::string command;
@@ -68,8 +103,9 @@ private:
     std::mutex queue_mutex;
     std::condition_variable condition;
     std::atomic<bool> stop;
-    KVDatabase& db;
-
+    DatabaseManager& dbManager;
+    std::unordered_map<int, std::string> clientDBs;
+    std::mutex dbMapMutex;
 
     std::vector<std::string> split(const std::string& s, char delimiter) {
         std::vector<std::string> tokens;
@@ -81,19 +117,34 @@ private:
         return tokens;
     }
 
-    std::string processCommand(const std::string& command) {
+    std::string processCommand(int client_socket, const std::string& command) {
         std::vector<std::string> tokens = split(command, ' ');
-        
         if (tokens.empty()) {
-            return "ERROR: Empty command\n";
+            return "error: empty command\n";
         }
+
+        if (tokens[0] == "USE" && tokens.size() == 2) {
+            std::lock_guard<std::mutex> lock(dbMapMutex);
+            clientDBs[client_socket] = tokens[1];
+            return "ok: switched to database " + tokens[1] + "\n";
+        }
+
+        std::string dbname = "db";
+        {
+            std::lock_guard<std::mutex> lock(dbMapMutex);
+            if (clientDBs.count(client_socket)) {
+                dbname = clientDBs[client_socket];
+            }
+        }
+
+        KVDatabase& db = dbManager.getDatabase(dbname);
 
         if (tokens[0] == "SET" && tokens.size() >= 3) {
             std::string value = tokens[2];
             for (size_t i = 3; i < tokens.size(); i++) {
                 value += " " + tokens[i];
             }
-            
+
             db.set(tokens[1], value);
             return "OK\n";
         } else if (tokens[0] == "GET" && tokens.size() == 2) {
@@ -109,12 +160,44 @@ private:
             } else {
                 return "ERROR: Key not found\n";
             }
-        } else if (tokens[0] == "KEYS" && tokens.size() == 1) {
-            std::vector<std::string> keys = db.keys();
-            if (keys.empty()) {
-                return "KEYS: (empty)\n";
+        } else if (tokens[0] == "HAS" && tokens.size() == 2) {
+            if (db.has(tokens[1])) {
+                return "YES: Key has\n";
+            } else {
+                return "NO: Key not found\n";
             }
-            
+        } else if (tokens[0] == "UPD" && tokens.size() >= 3) {
+            std::string new_value = tokens[2];
+            for (size_t i = 3; i < tokens.size(); i++) {
+                new_value += " " + tokens[i];
+            }
+            if (db.upd(tokens[1], new_value)) {
+                return "OK: Value update\n";
+            } else {
+                return "ERROR: Key not found\n";
+            }
+        }else if (tokens[0] == "DBNAME" && tokens.size() == 1) {
+            std::string dbname = "db";
+            {
+                std::lock_guard<std::mutex> lock(dbMapMutex);
+                if (clientDBs.count(client_socket)) {
+                    dbname = clientDBs[client_socket];
+                }
+            }
+            return "CURRENT DB: " + dbname + "\n";
+        }
+        else if (tokens[0] == "DBLIST" && tokens.size() == 1) {
+            std::vector<std::string> dbs = dbManager.listDatabases();
+            std::string result = "DATABASES:\n";
+            for (const auto& name : dbs) {
+                result += "- " + name + "\n";
+            }
+            return result;
+        }
+        
+
+        else if (tokens[0] == "KEYS" && tokens.size() == 1) {
+            std::vector<std::string> keys = db.keys();
             std::string result = "KEYS:\n";
             for (const auto& key : keys) {
                 result += "- " + key + "\n";
@@ -126,7 +209,7 @@ private:
     }
 
 public:
-    ThreadPool(size_t threads, KVDatabase& database) : stop(false), db(database) {
+    ThreadPool(size_t threads, DatabaseManager& manager) : stop(false), dbManager(manager) {
         for (size_t i = 0; i < threads; ++i) {
             workers.emplace_back([this] {
                 while (true) {
@@ -134,15 +217,14 @@ public:
                     {
                         std::unique_lock<std::mutex> lock(queue_mutex);
                         condition.wait(lock, [this] { return stop || !tasks.empty(); });
-                        if (stop && tasks.empty()) {
+                        if (stop && tasks.empty()){ 
                             return;
                         }
                         task = tasks.front();
                         tasks.pop();
                     }
-                    
-                    std::string result = processCommand(task.command);// Команд боловсруулна
-                    send(task.client_socket, result.c_str(), result.length(), 0);// Клиент рүү үр дүнг илгээнэ
+                    std::string result = processCommand(task.client_socket, task.command);
+                    send(task.client_socket, result.c_str(), result.length(), 0);
                 }
             });
         }
@@ -181,81 +263,48 @@ public:
         : port(port_num), pool(thread_pool), running(false) {}
 
     bool start() {
-        server_fd = socket(AF_INET, SOCK_STREAM, 0);//IPv4 TCP сокет үүсгэнэ
-        if (server_fd < 0) {
-            std::cerr << "Socket creation error" << std::endl;
-            return false;
-        }
+        server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd < 0) return false;
 
         int opt = 1;
-        if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) { //Порт дахин ашиглах (Энэ нь серверийг хааж, дахин эхлүүлэхэд өмнөх порт түгжигдэхээс сэргийлнэ.)
-            std::cerr << "Setsockopt error" << std::endl;
-            return false;
-        }
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
         struct sockaddr_in address;
-        address.sin_family = AF_INET;//AF_INET – IPv4 хаяг ашиглана.
-        address.sin_addr.s_addr = INADDR_ANY;//Бүх сүлжээний интерфэйс дээр ажиллана.
-        address.sin_port = htons(port);//port-ыг big-endian формат руу хөрвүүлнэ.
- 
-        if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {//bind() нь серверийг порт дээр холбож байна.
-            std::cerr << "Bind failed" << std::endl;
-            return false;
-        }
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = INADDR_ANY;
+        address.sin_port = htons(port);
 
-        if (listen(server_fd, 10) < 0) {//listen() нь серверийг клиентээс холболт хүлээх горимд оруулна.
-            std::cerr << "Listen failed" << std::endl;
-            return false;
-        }
+        if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) return false;
+        if (listen(server_fd, 10) < 0) return false;
 
         running = true;
-        listener_thread = std::thread([this, address]() {//listener_thread нэртэй шинэ утас үүсгэж, серверийг асуулгатай ажиллуулах.
-            std::cout << "Listener started on port " << port << std::endl;
-            
+        listener_thread = std::thread([this, address]() {
             while (running) {
-                int addrlen = sizeof(address);//accept() нь шинэ клиент холболтыг хүлээж авах бөгөөд шинэ сокет буцаана.
-                int client_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);//client_socket – тухайн клиенттэй холбогдох шинэ сокет.
-                
-                if (!running) break;//Хэрэв сервер унтраасан бол давталтыг зогсооно.
-                
-                if (client_socket < 0) {
-                    std::cerr << "Accept failed" << std::endl;//Хэрэв клиент холбогдож чадсангүй бол алдааны мэдэгдэл хэвлэнэ.
-                    continue;
-                }
-
-                std::cout << "Client connected" << std::endl;//Клиент холбогдвол мэдээлэл хэвлэнэ.
-                
+                int addrlen = sizeof(address);
+                int client_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
+                if (!running || client_socket < 0) continue;
+                std::cout << "Client connected" << std::endl;
                 std::thread([this, client_socket]() {
                     char buffer[1024] = {0};
-                    
                     while (true) {
                         memset(buffer, 0, sizeof(buffer));
                         int bytes_read = read(client_socket, buffer, sizeof(buffer));
-                        
                         if (bytes_read <= 0) {
-                            std::cout << "Client disconnected" << std::endl;
                             close(client_socket);
                             return;
                         }
-
                         std::string command(buffer);
-                        if (!command.empty() && command[command.length()-1] == '\n') {
-                            command.erase(command.length()-1);
-                        }
-
+                        if (!command.empty() && command.back() == '\n') command.pop_back();
                         if (command == "EXIT") {
-                            std::string msg = "Goodbye!\n";
-                            send(client_socket, msg.c_str(), msg.length(), 0);
+                            send(client_socket, "Goodbye!\n", 9, 0);
                             close(client_socket);
                             return;
                         }
-
                         pool.enqueue(Task(client_socket, command));
                     }
                 }).detach();
             }
         });
-
         return true;
     }
 
@@ -282,30 +331,23 @@ public:
 
 int main(int argc, char* argv[]) {
     int port = 8080;
-    if (argc > 1) {
-        port = std::stoi(argv[1]);
-    }
+    if (argc > 1) port = std::stoi(argv[1]);
 
     const int NUM_THREADS = 4;
-
-    KVDatabase db;
-
-    ThreadPool pool(NUM_THREADS, db);
-
+    DatabaseManager dbManager;
+    ThreadPool pool(NUM_THREADS, dbManager);
     ConnectionListener listener(port, pool);
+
     if (!listener.start()) {
         std::cerr << "Failed to start listener" << std::endl;
         return -1;
     }
 
-    std::cout << "Server started with " << NUM_THREADS << " worker threads" << std::endl;
+    std::cout << "Server started with " << NUM_THREADS << " worker threads on port " << port << std::endl;
     std::cout << "Press Enter to stop the server..." << std::endl;
-
     std::cin.get();
-    
-    std::cout << "Stopping server..." << std::endl;
+
     listener.stop();
     std::cout << "Server stopped" << std::endl;
-
     return 0;
 }
